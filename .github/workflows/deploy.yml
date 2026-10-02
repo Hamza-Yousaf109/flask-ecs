@@ -33,6 +33,10 @@ jobs:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
+      - name: Verify AWS identity
+        run: |
+          aws sts get-caller-identity
+
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
 
@@ -67,6 +71,22 @@ jobs:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
+      - name: Verify AWS identity
+        run: |
+          aws sts get-caller-identity
+
+      - name: Verify ECR repository
+        run: |
+          aws ecr describe-repositories \
+            --repository-names "$ECR_REPOSITORY" \
+            --region "$AWS_REGION"
+
+      - name: Check ECR repository policy
+        run: |
+          aws ecr get-repository-policy \
+            --repository-name "$ECR_REPOSITORY" \
+            --region "$AWS_REGION" || true
+
       - name: Login to Amazon ECR
         id: ecr-login
         uses: aws-actions/amazon-ecr-login@v2
@@ -76,22 +96,26 @@ jobs:
         run: |
           echo "account_id=$(aws sts get-caller-identity --query Account --output text)" >> "$GITHUB_OUTPUT"
 
+      - name: Verify Docker
+        run: |
+          docker version
+
       - name: Build Docker image
         run: |
           docker build \
-            -t $ECR_REPOSITORY:latest \
+            -t "$ECR_REPOSITORY:latest" \
             .
 
       - name: Tag Docker image
         run: |
           docker tag \
-            $ECR_REPOSITORY:latest \
-            ${{ steps.aws-account.outputs.account_id }}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPOSITORY}:latest
+            "$ECR_REPOSITORY:latest" \
+            "${{ steps.aws-account.outputs.account_id }}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPOSITORY}:latest"
 
       - name: Push Docker image to ECR
         run: |
           docker push \
-            ${{ steps.aws-account.outputs.account_id }}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPOSITORY}:latest
+            "${{ steps.aws-account.outputs.account_id }}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPOSITORY}:latest"
 
   deploy-ecs:
     name: Deploy to ECS
@@ -104,6 +128,10 @@ jobs:
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
+
+      - name: Verify AWS identity
+        run: |
+          aws sts get-caller-identity
 
       - name: Start ECS Service
         run: |
@@ -118,10 +146,12 @@ jobs:
         run: |
           aws ecs wait services-stable \
             --cluster "$ECS_CLUSTER" \
-            --services "$ECS_SERVICE"
+            --services "$ECS_SERVICE" \
+            --region "$AWS_REGION"
 
       - name: Deployment Complete
         run: |
           echo "ECS deployment completed successfully."
           echo "Cluster: $ECS_CLUSTER"
           echo "Service: $ECS_SERVICE"
+          echo "Region: $AWS_REGION"
