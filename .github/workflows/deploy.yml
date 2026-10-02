@@ -1,3 +1,4 @@
+
 name: Terraform Apply and Deploy
 
 on:
@@ -21,7 +22,7 @@ env:
 jobs:
 
   # ============================================================
-  # 1. Terraform Apply
+  # 1. Terraform - Infrastructure
   # ============================================================
   terraform-apply:
     name: Terraform Apply
@@ -68,12 +69,15 @@ jobs:
 
 
   # ============================================================
-  # 2. Build and Push Docker Image to ECR
+  # 2. Docker Build + Push to ECR
   # ============================================================
   docker-build-push:
     name: Build and Push Docker Image
     needs: terraform-apply
     runs-on: ubuntu-latest
+
+    outputs:
+      image_uri: ${{ steps.image.outputs.image_uri }}
 
     steps:
       - name: Checkout
@@ -94,46 +98,25 @@ jobs:
         run: |
           echo "account_id=$(aws sts get-caller-identity --query Account --output text)" >> "$GITHUB_OUTPUT"
 
-      - name: Verify ECR repository
-        run: |
-          aws ecr describe-repositories \
-            --repository-names "$ECR_REPOSITORY" \
-            --region "$AWS_REGION"
-
-      - name: Check ECR repository policy
-        run: |
-          aws ecr get-repository-policy \
-            --repository-name "$ECR_REPOSITORY" \
-            --region "$AWS_REGION" || true
-
-      - name: Check Docker
-        run: |
-          docker --version
-
-      - name: Test ECR login
-        run: |
-          aws ecr get-login-password \
-            --region "$AWS_REGION" | \
-          docker login \
-            --username AWS \
-            --password-stdin \
-            "${{ steps.aws-account.outputs.account_id }}.dkr.ecr.${AWS_REGION}.amazonaws.com"
-
       - name: Login to Amazon ECR
-        id: ecr-login
         uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set image variables
+        id: image
+        run: |
+          ECR_URI="${{ steps.aws-account.outputs.account_id }}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPOSITORY}"
+          IMAGE_URI="${ECR_URI}:${GITHUB_SHA}"
+
+          echo "ecr_uri=${ECR_URI}" >> "$GITHUB_OUTPUT"
+          echo "image_uri=${IMAGE_URI}" >> "$GITHUB_OUTPUT"
+
+          echo "Image URI: ${IMAGE_URI}"
 
       - name: Build Docker image
         run: |
           docker build \
-            -t "$ECR_REPOSITORY:latest" \
+            -t "${{ steps.image.outputs.image_uri }}" \
             .
-
-      - name: Tag Docker image
-        run: |
-          docker tag \
-            "$ECR_REPOSITORY:latest" \
-            "${{ steps.aws-account.outputs.account_id }}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPOSITORY}:latest"
 
       - name: Verify Docker image
         run: |
@@ -141,12 +124,18 @@ jobs:
 
       - name: Push Docker image to ECR
         run: |
-          docker push \
-            "${{ steps.aws-account.outputs.account_id }}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPOSITORY}:latest"
+          docker push "${{ steps.image.outputs.image_uri }}"
+
+      - name: Verify image in ECR
+        run: |
+          aws ecr describe-images \
+            --repository-name "$ECR_REPOSITORY" \
+            --image-ids imageTag="$GITHUB_SHA" \
+            --region "$AWS_REGION"
 
 
   # ============================================================
-  # 3. Deploy to ECS
+  # 3. Register New ECS Task Definition + Deploy
   # ============================================================
   deploy-ecs:
     name: Deploy to ECS
@@ -164,41 +153,129 @@ jobs:
         run: |
           aws sts get-caller-identity
 
-      - name: Verify ECS cluster
+      - name: Get current ECS task definition
         run: |
-          aws ecs describe-clusters \
-            --clusters "$ECS_CLUSTER" \
-            --region "$AWS_REGION"
+          aws ecs describe-task-definition \
+            --task-definition "$ECS_SERVICE" \
+            --region "$AWS_REGION" \
+            --query 'taskDefinition' \
+            --output json > task-definition.json
 
-      - name: Verify ECS service
+      - name: Update image in task definition
+        env:
+          IMAGE_URI: ${{ needs.docker-build-push.outputs.image_uri }}
         run: |
-          aws ecs describe-services \
-            --cluster "$ECS_CLUSTER" \
-            --services "$ECS_SERVICE" \
-            --region "$AWS_REGION"
+          jq \
+            --arg IMAGE "$IMAGE_URI" \
+            '.containerDefinitions[0].image = $IMAGE
+             | del(
+                 .taskDefinitionArn,
+                 .revision,
+                 .status,
+                 .requiresAttributes,
+                 .compatibilities,
+                 .registeredAt,
+                 .registeredBy
+               )' \
+            task-definition.json > new-task-definition.json
 
-      - name: Start ECS Service
+      - name: Register new ECS task definition
+        id: task-definition
+        run: |
+          TASK_DEFINITION_ARN=$(aws ecs register-task-definition \
+            --cli-input-json file://new-task-definition.json \
+            --region "$AWS_REGION" \
+            --query 'taskDefinition.taskDefinitionArn' \
+            --output text)
+
+          echo "task_definition_arn=$TASK_DEFINITION_ARN" >> "$GITHUB_OUTPUT"
+
+          echo "New task definition:"
+          echo "$TASK_DEFINITION_ARN"
+
+      - name: Deploy new task definition
         run: |
           aws ecs update-service \
             --cluster "$ECS_CLUSTER" \
             --service "$ECS_SERVICE" \
+            --task-definition "${{ steps.task-definition.outputs.task_definition_arn }}" \
             --desired-count 1 \
             --force-new-deployment \
             --region "$AWS_REGION"
 
-      - name: Wait for ECS Service
+      - name: Wait for ECS deployment
         run: |
+          echo "Waiting for ECS service to become stable..."
+
           aws ecs wait services-stable \
             --cluster "$ECS_CLUSTER" \
             --services "$ECS_SERVICE" \
             --region "$AWS_REGION"
 
-      - name: Deployment Complete
+          echo "ECS service is stable."
+
+
+  # ============================================================
+  # 4. Post Deployment Health Check
+  # ============================================================
+  health-check:
+    name: Post Deployment Health Check
+    needs: deploy-ecs
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Get ALB DNS
+        id: alb
         run: |
+          ALB_DNS=$(aws elbv2 describe-load-balancers \
+            --region "$AWS_REGION" \
+            --query "LoadBalancers[?LoadBalancerName=='simple-webapp-flask-dev-alb'].DNSName" \
+            --output text)
+
+          echo "ALB DNS: $ALB_DNS"
+          echo "alb_dns=$ALB_DNS" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for application
+        run: |
+          sleep 10
+
+      - name: Health check
+        run: |
+          HEALTH_URL="http://${{ steps.alb.outputs.alb_dns }}/health"
+
+          echo "Checking: $HEALTH_URL"
+
+          for i in {1..10}; do
+            echo "Health check attempt $i/10..."
+
+            if curl \
+              --fail \
+              --silent \
+              --show-error \
+              --max-time 10 \
+              "$HEALTH_URL"; then
+
+              echo ""
+              echo "=========================================="
+              echo "Application health check PASSED"
+              echo "=========================================="
+              exit 0
+            fi
+
+            echo "Application not ready yet. Waiting 10 seconds..."
+            sleep 10
+          done
+
+          echo ""
           echo "=========================================="
-          echo "ECS deployment completed successfully."
+          echo "Application health check FAILED"
           echo "=========================================="
-          echo "Cluster: $ECS_CLUSTER"
-          echo "Service: $ECS_SERVICE"
-          echo "Region: $AWS_REGION"
-          echo "ECR Repository: $ECR_REPOSITORY"
+
+          exit 1
+
