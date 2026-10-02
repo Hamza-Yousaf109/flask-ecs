@@ -19,6 +19,10 @@ env:
   ECS_SERVICE: simple-webapp-flask-dev
 
 jobs:
+
+  # ============================================================
+  # 1. Terraform Apply
+  # ============================================================
   terraform-apply:
     name: Terraform Apply
     runs-on: ubuntu-latest
@@ -42,20 +46,30 @@ jobs:
 
       - name: Terraform Format Check
         working-directory: ${{ env.TF_WORKING_DIR }}
-        run: terraform fmt -check -recursive
+        run: |
+          terraform fmt -check -recursive
 
       - name: Terraform Init
         working-directory: ${{ env.TF_WORKING_DIR }}
-        run: terraform init -input=false
+        run: |
+          terraform init -input=false
 
       - name: Terraform Validate
         working-directory: ${{ env.TF_WORKING_DIR }}
-        run: terraform validate
+        run: |
+          terraform validate
 
       - name: Terraform Apply
         working-directory: ${{ env.TF_WORKING_DIR }}
-        run: terraform apply -input=false -auto-approve
+        run: |
+          terraform apply \
+            -input=false \
+            -auto-approve
 
+
+  # ============================================================
+  # 2. Build and Push Docker Image to ECR
+  # ============================================================
   docker-build-push:
     name: Build and Push Docker Image
     needs: terraform-apply
@@ -75,6 +89,11 @@ jobs:
         run: |
           aws sts get-caller-identity
 
+      - name: Get AWS Account ID
+        id: aws-account
+        run: |
+          echo "account_id=$(aws sts get-caller-identity --query Account --output text)" >> "$GITHUB_OUTPUT"
+
       - name: Verify ECR repository
         run: |
           aws ecr describe-repositories \
@@ -87,18 +106,22 @@ jobs:
             --repository-name "$ECR_REPOSITORY" \
             --region "$AWS_REGION" || true
 
+      - name: Check Docker
+        run: |
+          docker --version
+
+      - name: Test ECR login
+        run: |
+          aws ecr get-login-password \
+            --region "$AWS_REGION" | \
+          docker login \
+            --username AWS \
+            --password-stdin \
+            "${{ steps.aws-account.outputs.account_id }}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+
       - name: Login to Amazon ECR
         id: ecr-login
         uses: aws-actions/amazon-ecr-login@v2
-
-      - name: Get AWS Account ID
-        id: aws-account
-        run: |
-          echo "account_id=$(aws sts get-caller-identity --query Account --output text)" >> "$GITHUB_OUTPUT"
-
-      - name: Verify Docker
-        run: |
-          docker version
 
       - name: Build Docker image
         run: |
@@ -112,11 +135,19 @@ jobs:
             "$ECR_REPOSITORY:latest" \
             "${{ steps.aws-account.outputs.account_id }}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPOSITORY}:latest"
 
+      - name: Verify Docker image
+        run: |
+          docker images
+
       - name: Push Docker image to ECR
         run: |
           docker push \
             "${{ steps.aws-account.outputs.account_id }}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPOSITORY}:latest"
 
+
+  # ============================================================
+  # 3. Deploy to ECS
+  # ============================================================
   deploy-ecs:
     name: Deploy to ECS
     needs: docker-build-push
@@ -132,6 +163,19 @@ jobs:
       - name: Verify AWS identity
         run: |
           aws sts get-caller-identity
+
+      - name: Verify ECS cluster
+        run: |
+          aws ecs describe-clusters \
+            --clusters "$ECS_CLUSTER" \
+            --region "$AWS_REGION"
+
+      - name: Verify ECS service
+        run: |
+          aws ecs describe-services \
+            --cluster "$ECS_CLUSTER" \
+            --services "$ECS_SERVICE" \
+            --region "$AWS_REGION"
 
       - name: Start ECS Service
         run: |
@@ -151,7 +195,10 @@ jobs:
 
       - name: Deployment Complete
         run: |
+          echo "=========================================="
           echo "ECS deployment completed successfully."
+          echo "=========================================="
           echo "Cluster: $ECS_CLUSTER"
           echo "Service: $ECS_SERVICE"
           echo "Region: $AWS_REGION"
+          echo "ECR Repository: $ECR_REPOSITORY"
