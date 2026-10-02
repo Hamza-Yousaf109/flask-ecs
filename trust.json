@@ -1,0 +1,28 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "Federated": "arn:aws:iam::992382771174:oidc-provider/token.actions.githubusercontent.com"
+      },
+      "Action": [
+        "sts:AssumeRoleWithWebIdentity",
+        "sts:TagSession"
+      ],
+      "Condition": {
+        "StringEquals": {
+          "token.actions.githubusercontent.com:aud": "sts.amazonaws.com"
+        },
+        "StringLike": {
+          "token.actions.githubusercontent.com:sub": [
+            "repo:Hamza-Yousaf109@121962133/flask-ecs@1401917591:pull_request",
+            "repo:Hamza-Yousaf109@121962133/flask-ecs@1401917591:ref:refs/heads/main",
+            "repo:Hamza-Yousaf109/flask-ecs:pull_request",
+            "repo:Hamza-Yousaf109/flask-ecs:ref:refs/heads/main"
+          ]
+        }
+      }
+    }
+  ]
+}
